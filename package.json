@@ -1,0 +1,19 @@
+{
+  "name": "wp-rest-api-redis-cache",
+  "version": "1.0.0",
+  "description": "Redis cache of WordPress REST API using Node.js/Express",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "author": "Michael Wood",
+  "license": "SEE LICENSE IN license.md",
+  "dependencies": {
+    "axios": "^0.27.2",
+    "cors": "^2.8.5",
+    "express": "^4.18.1",
+    "https": "^1.0.0",
+    "redis": "^4.2.0"
+  }
+}
