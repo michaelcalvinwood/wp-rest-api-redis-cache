@@ -1,7 +1,7 @@
 const DOMAIN = "wp-rest.appgalleria.com";
 const BASE_URL = "https://wp-rest.appgalleria.com";
 const REST_URL = "https://pymnts.com";
-const SECRET_KEY = 'ksdndkklw4890dfio409dfjoe0509e5oifdhrehhioer';
+const SECRET_KEY = 'ksdndkklw4890dfio409dfjoe0509e5oifdhrehhioers';
 
 // import required packages
 const express = require('express');
@@ -62,26 +62,59 @@ app.get('/reset-post-keys', (req, res) => {
     res.status(200).send(key);
 });
 
-app.get('/wp-json/wp/v2/posts', async (req, res) => {
-    const { type, per_page, page } = req.query;
+/*
+ * POSTS endpoint
+ * GET /wp/v2/posts
+ * https://developer.wordpress.org/rest-api/reference/posts/
+ */
 
-    if (!type) return res.status(400).send('missing type');
-    if (!per_page) return res.status(400).send('missing per_page');
-    if (!page) return res.status(400).send('missing page');
+// need to escape " and \ and all control characters such as \n,\t
+// try encodeURIComponent for now
 
-    const key = `${type}:${per_page}:${page}`;
+const sanitizeString = str => {
+
+    return encodeURIComponent(str);
+}
+
+const handleGet = async (endpoint, baseKey, req, res) => {
+    // generate a unique key
+    let key = baseKey;
+    
+        // add any key/value pairs from the query parameters
+        const queryParams = Object.keys(req.query);
+        for (let i = 0; i < queryParams.length; ++i) key += `::${sanitizeString(queryParams[i])}:${sanitizeString(req.query[queryParams[i]])}`;
+            
+        // add any key/value pairs from the url route params (e.g. /:id)
+        const urlParams = Object.keys(req.params);
+        for (let i = 0; i < urlParams.length; ++i) key += `::${sanitizeString(urlParams[i])}:${sanitizeString(req.params[urlParams[i]])}`;
+            
+    // check if key is in redis. If so send the JSON parsed result and we are done.
     const redisVal = await redis.get(key);
     if (redisVal) return res.status(200).json(JSON.parse(redisVal));
 
-    const request = {
-        url: `${REST_URL}/wp-json/wp/v2/posts`,
-        method: 'get',
-        params: req.query
-    };
+    // if there are url params then replace the params in the endpoint. E.g. replace :id with the id value itself.
+    for (let i = 0; i < urlParams.length; ++i) endpoint = endpoint.replace(`/:${urlParams[i]}`, `/${req.params[urlParams[i]]}`);
 
+    // format the request
+    let request = {};
+    if (queryParams.length) {
+        request = {
+            url: `${REST_URL}${endpoint}`,
+            method: 'get',
+            params: req.query
+        }
+    } else {
+        request = {
+            url: `${REST_URL}${endpoint}`,
+            method: 'get'
+        }
+    }
+
+    // make the request
+
+    //console.log(endpoint, key);
     axios(request)
     .then(response => {
-        //console.log(`${req.url}: success! ${typeof response.data}`);
         redis.set(key, JSON.stringify(response.data));
         res.status(200).json(response.data);
     })
@@ -89,55 +122,13 @@ app.get('/wp-json/wp/v2/posts', async (req, res) => {
         console.error(`${req.url}: error!`);
         res.status(400).json(err.response.data);
     })
-});
+}
 
-app.get('/wp-json/wp/v2/media/:id', async (req, res) => {
-    const { id } = req.params;
+app.get('/wp-json/wp/v2/posts', async (req, res) => handleGet ('/wp-json/wp/v2/posts', 'posts', req, res));
 
-    const request = {
-        url: `${REST_URL}/wp-json/wp/v2/media/${id}`,
-        method: 'get'
-    };
-
-    const key = `media:${id}`;
-    const redisVal = await redis.get(key);
-    if (redisVal) return res.status(200).json(JSON.parse(redisVal));
-
-    axios(request)
-    .then(response => {
-        //console.log(`${req.url}: success! ${typeof response.data}`);
-        redis.set(key, JSON.stringify(response.data));
-        res.status(200).json(response.data);
-    })
-    .catch(err => {
-        console.error(`${req.url}: error!`);
-        res.status(400).json(err.response.data);
-    })
-});
-
-app.get('/wp-json/wp/v2/categories/:id', async (req, res) => {
-    const { id } = req.params;
-
-    const request = {
-        url: `${REST_URL}/wp-json/wp/v2/categories/${id}`,
-        method: 'get'
-    };
-
-    const key = `categories:${id}`;
-    const redisVal = await redis.get(key);
-    if (redisVal) return res.status(200).json(JSON.parse(redisVal));
-
-    axios(request)
-    .then(response => {
-       //console.log(`${req.url}: success!`);
-        redis.set(key, JSON.stringify(response.data));
-        res.status(200).json(response.data);
-    })
-    .catch(err => {
-        console.error(`${req.url}: error!`);
-        res.status(400).json(err.response.data);
-    })
-})
+app.get('/wp-json/wp/v2/media/:id', async (req, res) => handleGet('/wp-json/wp/v2/media/:id', 'mediaId', req, res));
+   
+app.get('/wp-json/wp/v2/categories/:id', async (req, res) => handleGet('/wp-json/wp/v2/categories/:id', 'categoriesId', req, res));
 
 const httpsServer = https.createServer({
   key: fs.readFileSync(`/etc/letsencrypt/live/${DOMAIN}/privkey.pem`),
