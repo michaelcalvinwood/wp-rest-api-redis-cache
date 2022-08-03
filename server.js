@@ -1,3 +1,9 @@
+/*
+ * TODO
+ *      write a function that gets the tagId for all tags that have post groups on the website so we can look for those ids in the new post page.
+ *      Automatically update tag collections if new post contains tags for: earning, etc. (see today page for list of tag slugs to look out for).
+ */
+
 const DOMAIN = "api.appgalleria.com";
 const BASE_URL = "https://api.appgalleria.com";
 const REST_URL = "https://pymnts.com";
@@ -14,18 +20,22 @@ const https = require('https');
 const fs = require('fs');
 const { application } = require('express');
 const axios = require('axios');
+const lodash = require('lodash');
 
 const redisPackage = require('redis');
+const { serialize } = require('v8');
 const redis = redisPackage.createClient();
 redis.on('connect', async () => {
     console.log('redis connected!');
 });
 redis.connect();
 
+const displayError = err => console.error(serializerr(err));
+
 // create new express app and save it as "app"
 const app = express();
 
-// monitor urls being requested
+//monitor urls being requested
 // app.use((req, res, next) => {
 //     console.log(req.url);
 //     next();
@@ -33,26 +43,6 @@ const app = express();
 
 app.use(express.json({limit: '200mb'}));
 app.use(cors());
-
-// create a route for the app
-app.get('/', (req, res) => {
-  res.send('Hello you!');
-});
-
-
-// 1) Serve as a passthrough
-// 2) Add standard REDIS caching
-// 3) Add custom route to reduce API calls to one per need
-// 4) Add plugin hooks for realtime updating of keys
-
-// IMPORTANT: Add a route with api-key for when a new post is created. Add a field to all posts that calls this route whenever a new post is created or updated
-
-// ?type=posts&per_page=21&page=2
-
-// posts/:perPage/:curPage
-
-// updatePosts/ api-key
-
 
 const isAlphanumeric = str => {
     if (str.match(/^[0-9a-z]+$/i)) return true;
@@ -67,22 +57,12 @@ app.get('/reset-post-keys', (req, res) => {
     res.status(200).send(key);
 });
 
-/*
- * POSTS endpoint
- * GET /wp/v2/posts
- * https://developer.wordpress.org/rest-api/reference/posts/
- */
-
-// need to escape " and \ and all control characters such as \n,\t
-// try encodeURIComponent for now
 
 const sanitizeString = str => {
-
     return encodeURIComponent(str);
 }
 
-const processRequest = async (endpoint, baseKey, req, successCallback = null, res = null, errorCallback = null) => {
-    console.log('processRequest', endpoint);
+const generateKey = (baseKey, req) => {
     let key = baseKey;
 
     const urlParams = Object.keys(req.params);
@@ -90,13 +70,32 @@ const processRequest = async (endpoint, baseKey, req, successCallback = null, re
 
     const queryParams = Object.keys(req.query);
     for (let i = 0; i < queryParams.length; ++i) key += `::${sanitizeString(queryParams[i])}:${sanitizeString(req.query[queryParams[i]])}`;
-    
-    // check if key is in redis. If so send the JSON parsed result and we are done.
-    console.log('key', key);
-    const redisVal = await redis.get(key);
-    if (redisVal) return successCallback ? successCallback(JSON.parse(redisVal), res) : JSON.parse(redisVal);
-    if (!successCallback) return false;
 
+
+    return key
+}
+
+
+/*
+ * processRequest
+ *      if res is provided: sends cached value if exists. Otherwise executes request and sets associated key value.
+ *      if res is null: executes request and updates the associated key in the cache.
+ */
+
+const processRequest = async (endpoint, baseKey, req, res = null) => {
+    let key = generateKey(baseKey, req);
+
+    //console.log('processRequest', endpoint, key);
+
+    // check if key is in redis. If so send the JSON parsed result and we are done.
+    if (res) {
+        const redisVal = await redis.get(key);
+        if (redisVal) return res.status(200).send(redisVal);
+    }
+
+    const urlParams = Object.keys(req.params);
+    const queryParams = Object.keys(req.query);
+    
     // if there are url params then replace the params in the endpoint. E.g. replace :id with the id value itself.
     for (let i = 0; i < urlParams.length; ++i) endpoint = endpoint.replace(`/:${urlParams[i]}`, `/${req.params[urlParams[i]]}`);
 
@@ -115,47 +114,65 @@ const processRequest = async (endpoint, baseKey, req, successCallback = null, re
         }
     }
 
-    // make the request
-
-    console.log('request', request);
-    
-    //console.log(endpoint, key);
-
     axios(request)
     .then(response => {
-        const { data } = response;
-        redis.set(key, JSON.stringify(data));
-        return successCallback(data, res);
-        
+        let { data } = response;
+
+        // strip content and other fields from bulk posts to save space in the redis cache
+        if (baseKey === 'posts') {
+            data = data.map(post => {
+                let info = {};
+                info.id = post.id;
+                info.date_gmt = post.date_gmt;
+                info.modified_gmt = post.modified_gmt;
+                info.slug = post.slug;
+                info.status = post.status;
+                info.link = post.link;
+                info.title = { rendered: post.title.rendered};
+                info.excerpt = { rendered: post.excerpt.rendered};
+                info.author = post.author;
+                info.featured_media = post.featured_media;
+                info.categories = post.categories;
+                info.tags = post.tags;
+                //console.log(post._links);       
+                info._links = lodash.cloneDeep(post._links);
+                //console.log('info._links', info._links);
+                return info;
+           });
+        }
+
+        const stringData = JSON.stringify(data);
+        redis.set(key, stringData);
+        //console.log(`successfully updated ${key}`);
+        //redis.rPush(`list:${baseKey}`, key);
+        if (res) res.status(200).send(stringData);
+
     })
     .catch(err => {
         console.error(serializerr(err));
-        if (errorCallback) errorCallback(err, res);
-    })
-}
-
-const successfulGet = (data, res) => {
-    return res.status(200).json(data);
-}
-
-const unsuccessfulGet = (err, res) => {
-    return res.status(400).send('invalid request');
+        if (res) res.status(400).send('invalid request');
+    });
 }
 
 const handleGet = (endpoint, baseKey, req, res) => {
-    processRequest(endpoint, baseKey, req, successfulGet, res, unsuccessfulGet);
+    processRequest(endpoint, baseKey, req, res);
 }
 
 // Use cache to generate full page of posts if such info is in cache
+
+let PageOfPostsMaxCurPage = 1;
+
 const getPageOfPosts = async (endpoint, baseKey, req, res) => {
-    console.log('ts1', Date.now());
-    const key = `pageOfPosts::${req.params.numPerPage}:${req.params.curPage}`;
-    const postData = await redis.get(key);
-    console.log('ts2', Date.now());
-    if (postData) {
-        console.log('got page key');
-        return res.status(200).json(JSON.parse(postData));
-    }
+
+    // const { numPerPage, curPage } = req.params;
+    // if (curPage > PageOfPostsMaxCurPage) PageOfPostsMaxCurPage = curPage;
+
+    // const key = `pageOfPosts::${numPerPage}:${curPage}`;
+    
+    // const postData = await redis.get(key);
+    // if (postData) {
+    //     return res.status(200).json(JSON.parse(postData));
+    // }
 
     let request = {
         query: {
@@ -166,8 +183,10 @@ const getPageOfPosts = async (endpoint, baseKey, req, res) => {
         params: {}
     }
 
-    const posts = await processRequest('/wp-json/wp/v2/posts', 'posts', request);
+    let testKey = generateKey('posts', request);
+    let posts = await redis.get(testKey);
     if (!posts) return res.status(400).json(false);
+    posts = JSON.parse(posts);
 
     let url = '';
     let loc = -1;
@@ -188,10 +207,12 @@ const getPageOfPosts = async (endpoint, baseKey, req, res) => {
             }
         }
 
-        mediaInfo = await processRequest('/wp-json/wp/v2/media/:id', 'mediaId', request);
+        testKey = generateKey('mediaId', request);
+        mediaInfo = await redis.get(testKey);
 
         // if media info is not in the cache return status 400
         if (!mediaInfo) return res.status(400).json(false);
+        mediaInfo = JSON.parse(mediaInfo);
         
         // if media info is in cache, add it to the posts array
         posts[i].mediaInfo = mediaInfo;
@@ -206,9 +227,11 @@ const getPageOfPosts = async (endpoint, baseKey, req, res) => {
                 }
             }
     
-            categoryInfo = await processRequest('/wp-json/wp/v2/categories/:id', 'categoriesId', request);
+            testKey = generateKey('categoriesId', request);
+            categoryInfo = await redis.get(testKey);
             
             if (!categoryInfo) return res.status(400).json(false);
+            categoryInfo = JSON.parse(categoryInfo);
 
             posts[i].categoryInfo = categoryInfo;
 
@@ -217,10 +240,111 @@ const getPageOfPosts = async (endpoint, baseKey, req, res) => {
         }
     }
 
-    redis.set(key, JSON.stringify(posts));
+    //redis.set(key, JSON.stringify(posts));
     res.status(200).send(posts);
 }
 
+const LatestPost = {
+    id: 0,
+    date_gmt: '',
+    modified_gmt: ''
+}
+
+
+
+const handleNewPosts = async () => {
+   // check for new posts
+   let request = {
+        url: `${REST_URL}/wp-json/wp/v2/posts/?type=posts&per_page=100`,
+        method: 'get'
+   }
+   let response;
+   
+   try {
+        response = await axios(request);
+   }    
+   catch(err) {
+        displayError(err);
+        return;
+   }
+
+   const { data } = response;
+
+   const { id, date_gmt, modified_gmt, featured_media, categories, tags } = data[0];
+
+   if (id === LatestPost.id && modified_gmt === LatestPost.modified_gmt) return;
+
+   // If we are here, we have at least one new post
+
+   LatestPost.id = id;
+   LatestPost.modified_gmt = modified_gmt;
+   LatestPost.date_gmt = date_gmt;
+
+   console.log('New Post!', id, date_gmt, modified_gmt, featured_media, categories, tags);
+
+
+   let key, result, categoryId;
+
+   // add any missing mediaId and categoryId key/value pairs to the cache
+   for (let i = 0; i < data.length; ++i) {
+        const { featured_media, categories } = data[i];
+
+        if (featured_media) {
+            key = `mediaId::id:${featured_media}`;
+            result = await redis.get(key);
+            //result ? console.log(`mediaId ${featured_media} success`) : console.log(`mediaId ${featured_media} failure`);
+
+            if (!result) {
+                request = {
+                    query: {},
+                    params: {
+                        id: featured_media 
+                    }
+                }
+                processRequest('/wp-json/wp/v2/media/:id', 'mediaId', request);
+            }
+        }
+
+        if (categories && categories.length) {
+            categoryId = categories[0];
+            
+            key = `categoriesId::id:${categoryId}`;
+            result = await redis.get(key);
+            //result ? console.log(`categoryId ${categoryId} success`) : console.log(`categoryId ${categoryId} failure`);
+
+            if (!result) {
+                request = {
+                    query: {},
+                    params: {
+                        id: categoryId 
+                    }
+                }
+                processRequest('/wp-json/wp/v2/categories/:id', 'categoriesId', request);
+            }
+
+        }
+   }
+
+   // 10 seconds later, update the first five pages of posts
+
+   setTimeout(() => {
+        for (let i = 1; i <= 5; ++i) {
+            request = {
+                query: {
+                    type: 'posts',
+                    per_page: 21,
+                    page: i
+                },
+                params: {}
+            }
+            processRequest('/wp-json/wp/v2/posts', 'posts', request);
+        }
+   }, 10000);
+
+   // 30 seconds later, delete pageOfPosts key
+
+   
+}
 
 // Generic WP REST API endpoints
 
@@ -257,8 +381,10 @@ app.get('/wp-json/wp/v2/search/',  (req, res) => handleGet('/wp-json/wp/v2/searc
 
 app.get('/wp-json/wp/v2/custom/page-of-posts/:curPage/:numPerPage', (req, res) => getPageOfPosts('/wp-json/wp/v2/custom/page-of-posts/:curPage/:numPerPage', 'pageOfPosts', req, res));
 
+// app.get('/new-post/:id', (req, res) => handleNewPost(req, res));
 
 
+// server listening
 
 const httpServer = http.createServer(app);
 httpServer.listen(HTTP_PORT, () => {
@@ -274,4 +400,6 @@ const httpsServer = https.createServer({
   
   httpsServer.listen(HTTPS_PORT, () => {
       console.log(`HTTPS Server running on port ${HTTPS_PORT}`);
+      setInterval(handleNewPosts, 30000);
   });
+
