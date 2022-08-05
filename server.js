@@ -1,3 +1,13 @@
+// IMPORTANT: check custom ttl first, if not present use default ttl
+const defaultTTL = 86400;
+const customTTL = [];
+const addCustomTTL = (route, ttl) => customTTL.push({route, ttl});
+addCustomTTL('/topic', 30000);
+addCustomTTL('/category', 30000);
+addCustomTTL('/tag', 30000);
+addCustomTTL('/b2b', 30000);
+
+
 /*
  * TODO
  *      write a function that gets the tagId for all tags that have post groups on the website so we can look for those ids in the new post page.
@@ -62,7 +72,58 @@ const sanitizeString = str => {
     return encodeURIComponent(str);
 }
 
-const generateKey = (baseKey, req) => {
+const generateUrlKey = path => `url:${path}`;
+
+const getTTL = path => {
+    let ttl = defaultTTL;
+
+    for (let i = 0; i < customTTL.length; ++i) {
+        if (path.startsWith(customTTL[i].route)) {
+            ttl = customTTL[i].ttl;
+            break;
+        } 
+    }
+
+    return ttl;
+}
+
+const updateUrlKey = (path, key = '', ttl = null) => {
+    if (!ttl) ttl = getTTL(path);
+    if (!key) key = generateUrlKey(path);
+
+    const request = {
+        url: path.indexOf('?') !== -1 ? `https://www.pymnts.com${path}&preview=true` : `https://www.pymnts.com${path}?preview=true`,
+        method: 'get'
+    };
+
+    axios(request)
+    .then(response => {
+        console.log(`set key: ${key}`);
+        redis.set(key, response.data, {EX: ttl});
+    })
+    .catch(err => {
+        // perhaps set key to error message here and check send no when result exists but se
+    })
+}
+
+const cacheUrl = async (req, res) => {
+    const path = req.url.substring(10);
+    const ttl = getTTL(path);
+    let key = generateUrlKey(path);
+    
+    const result = await redis.get(key);
+
+    if (result) {
+        console.log(`Got key: ${key}`);
+        return res.status(200).send(result);
+    }
+    res.status(200).send('no');
+
+    updateUrlKey(path, key, ttl);
+}
+
+
+const generateRestKey = (baseKey, req) => {
     let key = baseKey;
 
     const urlParams = Object.keys(req.params);
@@ -83,7 +144,7 @@ const generateKey = (baseKey, req) => {
  */
 
 const processRequest = async (endpoint, baseKey, req, res = null) => {
-    let key = generateKey(baseKey, req);
+    let key = generateRestKey(baseKey, req);
 
     //console.log('processRequest', endpoint, key);
 
@@ -163,17 +224,6 @@ const handleGet = (endpoint, baseKey, req, res) => {
 let PageOfPostsMaxCurPage = 1;
 
 const getPageOfPosts = async (endpoint, baseKey, req, res) => {
-
-    // const { numPerPage, curPage } = req.params;
-    // if (curPage > PageOfPostsMaxCurPage) PageOfPostsMaxCurPage = curPage;
-
-    // const key = `pageOfPosts::${numPerPage}:${curPage}`;
-    
-    // const postData = await redis.get(key);
-    // if (postData) {
-    //     return res.status(200).json(JSON.parse(postData));
-    // }
-
     let request = {
         query: {
             type: 'posts',
@@ -183,7 +233,7 @@ const getPageOfPosts = async (endpoint, baseKey, req, res) => {
         params: {}
     }
 
-    let testKey = generateKey('posts', request);
+    let testKey = generateRestKey('posts', request);
     let posts = await redis.get(testKey);
     if (!posts) return res.status(400).json(false);
     posts = JSON.parse(posts);
@@ -207,7 +257,7 @@ const getPageOfPosts = async (endpoint, baseKey, req, res) => {
             }
         }
 
-        testKey = generateKey('mediaId', request);
+        testKey = generateRestKey('mediaId', request);
         mediaInfo = await redis.get(testKey);
 
         // if media info is not in the cache return status 400
@@ -227,7 +277,7 @@ const getPageOfPosts = async (endpoint, baseKey, req, res) => {
                 }
             }
     
-            testKey = generateKey('categoriesId', request);
+            testKey = generateRestKey('categoriesId', request);
             categoryInfo = await redis.get(testKey);
             
             if (!categoryInfo) return res.status(400).json(false);
@@ -249,8 +299,6 @@ const LatestPost = {
     date_gmt: '',
     modified_gmt: ''
 }
-
-
 
 const handleNewPosts = async () => {
    // check for new posts
@@ -274,8 +322,22 @@ const handleNewPosts = async () => {
 
    if (id === LatestPost.id && modified_gmt === LatestPost.modified_gmt) return;
 
+   // Update UrlKeys
    // If we are here, we have at least one new post
+ 
+    updateUrlKey('/');
+    updateUrlKey('/today-on-pymnts');
+    
+   // Three things update for url cache
+        // rekey the post itself if the modified time is different
+        // cycle through tags and update topics page and other tag driven pages
+            // investigate the topics 
+            // For now any key starting with /topic will be cached for 30 minutes until we can determine a realtime trigger
+            // realtime update /tag/tagName /topic/tagName /category/tagName
+            // /sitemap.xml 10 minute caching
+                // anything route starting with /sitemap 10 minute cache
 
+   
    LatestPost.id = id;
    LatestPost.modified_gmt = modified_gmt;
    LatestPost.date_gmt = date_gmt;
@@ -377,9 +439,24 @@ app.get('/wp-json/wp/v2/users/',  (req, res) => handleGet('/wp-json/wp/v2/users/
 
 app.get('/wp-json/wp/v2/search/',  (req, res) => handleGet('/wp-json/wp/v2/search/', 'search', req, res));
 
-// Custom endpoints
+// Custom REST endpoints
 
 app.get('/wp-json/wp/v2/custom/page-of-posts/:curPage/:numPerPage', (req, res) => getPageOfPosts('/wp-json/wp/v2/custom/page-of-posts/:curPage/:numPerPage', 'pageOfPosts', req, res));
+
+
+
+// NEVER use this command in production. For development ONLY.
+const deleteRedisKeys = async prefix => {
+    const keys = await redis.keys(prefix + '*');
+    for (let i = 0; i < keys.length; ++i) {
+        redis.del(keys[i]);
+    }
+}
+
+
+// IMPORTANT: TRY THIS for unlimited folders: https://stackoverflow.com/questions/6161567/express-js-wildcard-routing-to-cover-everything-under-and-including-a-path
+
+app.get('/url-cache(/*)?', (req, res) => cacheUrl(req, res));
 
 // app.get('/new-post/:id', (req, res) => handleNewPost(req, res));
 
@@ -402,4 +479,3 @@ const httpsServer = https.createServer({
       console.log(`HTTPS Server running on port ${HTTPS_PORT}`);
       setInterval(handleNewPosts, 30000);
   });
-
