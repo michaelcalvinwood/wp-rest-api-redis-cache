@@ -1,12 +1,12 @@
-// IMPORTANT: check custom ttl first, if not present use default ttl
-const defaultTTL = 86400;
-const customTTL = [];
-const addCustomTTL = (route, ttl) => customTTL.push({route, ttl});
-addCustomTTL('/topic', 30000);
-addCustomTTL('/category', 30000);
-addCustomTTL('/tag', 30000);
-addCustomTTL('/b2b', 30000);
+let defaultTTLMinutes = 30;
+let refreshTTLMinutes = defaultTTLMinutes - 3;
+let minuteUpdates = []; // array of urls to update every one minute
+const maxMinuteUpdates = 100; // prevent ddos attacks
 
+// ensure suitable ranges for the TTL Minute variables
+if (defaultTTLMinutes < 3) defaultTTLMinutes = 3;
+if (refreshTTLMinutes >= defaultTTLMinutes) refreshTTLMinutes = defaultTTLMinutes - 3;
+if (refreshTTLMinutes < 0) refreshTTLMinutes = 1;
 
 /*
  * TODO
@@ -14,10 +14,11 @@ addCustomTTL('/b2b', 30000);
  *      Automatically update tag collections if new post contains tags for: earning, etc. (see today page for list of tag slugs to look out for).
  */
 
-const DOMAIN = "api.appgalleria.com";
-const BASE_URL = "https://api.appgalleria.com";
-const REST_URL = "https://pymnts.com";
-const SECRET_KEY = 'ksdndkklw4890dfio409dfjoe0509e5oifdhrehhioers';
+require('dotenv').config()
+const DOMAIN = process.env.DOMAIN;
+const BASE_URL = process.env.BASE_URL;
+const REST_URL = process.env.REST_URL;
+const SECRET_KEY = process.env.SECRET_KEY;
 const HTTP_PORT = 5001;
 const HTTPS_PORT = 5000;
 
@@ -32,6 +33,10 @@ const { application } = require('express');
 const axios = require('axios');
 const lodash = require('lodash');
 
+// express server
+const app = express();
+
+// redis
 const redisPackage = require('redis');
 const { serialize } = require('v8');
 const redis = redisPackage.createClient();
@@ -41,9 +46,6 @@ redis.on('connect', async () => {
 redis.connect();
 
 const displayError = err => console.error(serializerr(err));
-
-// create new express app and save it as "app"
-const app = express();
 
 //monitor urls being requested
 // app.use((req, res, next) => {
@@ -72,54 +74,56 @@ const sanitizeString = str => {
     return encodeURIComponent(str);
 }
 
-const generateUrlKey = path => `url:${path}`;
-
-const getTTL = path => {
-    let ttl = defaultTTL;
-
-    for (let i = 0; i < customTTL.length; ++i) {
-        if (path.startsWith(customTTL[i].route)) {
-            ttl = customTTL[i].ttl;
-            break;
-        } 
-    }
-
-    return ttl;
-}
-
-const updateUrlKey = (path, key = '', ttl = null) => {
-    if (!ttl) ttl = getTTL(path);
-    if (!key) key = generateUrlKey(path);
+const updateKey = (url, key = null) => {
+    if (!key) key = `url:${url}`;
 
     const request = {
-        url: path.indexOf('?') !== -1 ? `https://www.pymnts.com${path}&preview=true` : `https://www.pymnts.com${path}?preview=true`,
+        url: url.indexOf('?') !== -1 ? `${url}&cache=skip` : `${url}?cache=skip`,
         method: 'get'
-    };
+    }
 
     axios(request)
     .then(response => {
-        console.log(`set key: ${key}`);
-        redis.set(key, response.data, {EX: ttl});
+        redis.set(key, response.data, {EX: defaultTTLMinutes * 60});
     })
-    .catch(err => {
-        // perhaps set key to error message here and check send no when result exists but se
-    })
+    .catch(err => console.error(err));
 }
 
-const cacheUrl = async (req, res) => {
-    const path = req.url.substring(10);
-    const ttl = getTTL(path);
-    let key = generateUrlKey(path);
-    
-    const result = await redis.get(key);
+setInterval(() => {
+    for (let i = 0; i < minuteUpdates.length; ++i) updateKey(minuteUpdates[i]);
+}, 60000);
 
+const cacheUrl = async (req, res) => {
+    const { preview, update, url, ttl } = req.query;
+    if (!url) return;
+
+    if (ttl) minuteUpdates = minuteUpdates.filter(link => link !== url);
+
+    if (update) {
+        let test = minuteUpdates.find(link => link === url);
+        if (!test && minuteUpdates.length < maxMinuteUpdates) minuteUpdates.push(url);
+    }
+
+    if (ttl || update) console.log(minuteUpdates);
+
+    let key = '';
+    let gotContent = false;
+    
+    key = `url:${url}`;
+    const result = await redis.get(key);
     if (result) {
         console.log(`Got key: ${key}`);
-        return res.status(200).send(result);
+        gotContent = true;
+        res.status(200).send(result);
+    }    
+    
+    if (!gotContent) res.status(200).send('no');
+    else {
+        let timeRemaining = await redis.ttl(key);
+        if (timeRemaining && timeRemaining > (refreshTTLMinutes * 60) && !preview) return;
     }
-    res.status(200).send('no');
 
-    updateUrlKey(path, key, ttl);
+    if (key) updateKey(url, key);
 }
 
 
@@ -194,18 +198,14 @@ const processRequest = async (endpoint, baseKey, req, res = null) => {
                 info.author = post.author;
                 info.featured_media = post.featured_media;
                 info.categories = post.categories;
-                info.tags = post.tags;
-                //console.log(post._links);       
+                info.tags = post.tags;  
                 info._links = lodash.cloneDeep(post._links);
-                //console.log('info._links', info._links);
                 return info;
            });
         }
 
         const stringData = JSON.stringify(data);
         redis.set(key, stringData);
-        //console.log(`successfully updated ${key}`);
-        //redis.rPush(`list:${baseKey}`, key);
         if (res) res.status(200).send(stringData);
 
     })
@@ -322,28 +322,11 @@ const handleNewPosts = async () => {
 
    if (id === LatestPost.id && modified_gmt === LatestPost.modified_gmt) return;
 
-   // Update UrlKeys
-   // If we are here, we have at least one new post
- 
-    updateUrlKey('/');
-    updateUrlKey('/today-on-pymnts');
-    
-   // Three things update for url cache
-        // rekey the post itself if the modified time is different
-        // cycle through tags and update topics page and other tag driven pages
-            // investigate the topics 
-            // For now any key starting with /topic will be cached for 30 minutes until we can determine a realtime trigger
-            // realtime update /tag/tagName /topic/tagName /category/tagName
-            // /sitemap.xml 10 minute caching
-                // anything route starting with /sitemap 10 minute cache
-
-   
    LatestPost.id = id;
    LatestPost.modified_gmt = modified_gmt;
    LatestPost.date_gmt = date_gmt;
 
-   console.log('New Post!', id, date_gmt, modified_gmt, featured_media, categories, tags);
-
+   //console.log('New Post!', id, date_gmt, modified_gmt, featured_media, categories, tags);
 
    let key, result, categoryId;
 
@@ -354,7 +337,6 @@ const handleNewPosts = async () => {
         if (featured_media) {
             key = `mediaId::id:${featured_media}`;
             result = await redis.get(key);
-            //result ? console.log(`mediaId ${featured_media} success`) : console.log(`mediaId ${featured_media} failure`);
 
             if (!result) {
                 request = {
@@ -372,7 +354,6 @@ const handleNewPosts = async () => {
             
             key = `categoriesId::id:${categoryId}`;
             result = await redis.get(key);
-            //result ? console.log(`categoryId ${categoryId} success`) : console.log(`categoryId ${categoryId} failure`);
 
             if (!result) {
                 request = {
@@ -383,7 +364,6 @@ const handleNewPosts = async () => {
                 }
                 processRequest('/wp-json/wp/v2/categories/:id', 'categoriesId', request);
             }
-
         }
    }
 
@@ -411,7 +391,10 @@ const handleNewPosts = async () => {
 // Generic WP REST API endpoints
 
 app.get('/wp-json/wp/v2/posts/:id',  (req, res) => handleGet('/wp-json/wp/v2/posts/:id', 'postsId', req, res));
-app.get('/wp-json/wp/v2/posts',  (req, res) => handleGet ('/wp-json/wp/v2/posts', 'posts', req, res));
+app.get('/wp-json/wp/v2/posts',  (req, res) => {
+    console.log(req.url, req.query, req.params);
+    handleGet ('/wp-json/wp/v2/posts', 'posts', req, res)
+});
 
 app.get('/wp-json/wp/v2/categories/:id',  (req, res) => handleGet('/wp-json/wp/v2/categories/:id', 'categoriesId', req, res));
 app.get('/wp-json/wp/v2/categories/',  (req, res) => handleGet('/wp-json/wp/v2/categories/', 'categories', req, res));
@@ -453,10 +436,7 @@ const deleteRedisKeys = async prefix => {
     }
 }
 
-
-// IMPORTANT: TRY THIS for unlimited folders: https://stackoverflow.com/questions/6161567/express-js-wildcard-routing-to-cover-everything-under-and-including-a-path
-
-app.get('/url-cache(/*)?', (req, res) => cacheUrl(req, res));
+app.get('/url-cache', (req, res) => cacheUrl(req, res));
 
 // app.get('/new-post/:id', (req, res) => handleNewPost(req, res));
 
@@ -477,5 +457,13 @@ const httpsServer = https.createServer({
   
   httpsServer.listen(HTTPS_PORT, () => {
       console.log(`HTTPS Server running on port ${HTTPS_PORT}`);
-      setInterval(handleNewPosts, 30000);
+      //setInterval(handleNewPosts, 60000);
   });
+
+// let request = {
+//     url: "https://dev.pymnts.com",
+//     method: 'get'
+// }
+// axios(request)
+// .then(response => console.log(response.data))
+// .catch(err => console.error(err));
